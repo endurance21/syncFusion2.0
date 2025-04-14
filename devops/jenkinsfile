@@ -1,0 +1,216 @@
+def jobnameparts = JOB_NAME.tokenize('/') as String[]
+def jobconsolename = jobnameparts[0]
+pipeline {
+  agent any
+   tools {
+     jdk 'openjdk17'
+     }
+  parameters
+  {
+    choice(name: 'PURPOSE', choices: ['BUILD','DEPLOY',])
+  }
+  environment {
+    PROJECT_NAME = "${jobconsolename}"
+    DOMAIN_NAME = "${BRANCH_NAME}.${jobconsolename}.blackbox.nobrokerhood.com"
+    STACK_NAME = "${jobconsolename}-${BRANCH_NAME}"
+    API_BUILD = "${BUILD_NUMBER}"
+    PURPOSE = "${PURPOSE}"
+    DATA_COUNT = "${params.FORCEFUL_DATA_IMPORT == true ? "1" : "0"}"
+    DATA_VERSION = sh (script: 'cat /var/jenkins_home/scripts/explore_data_export_version',returnStdout: true).trim()
+  }
+  stages {
+    stage('Build image') {
+      steps {
+        script {
+          // Build the jars
+          withCredentials([usernamePassword(credentialsId: 'Bitbucket', usernameVariable: 'BITBUCKET_USERNAME', passwordVariable: 'BITBUCKET_PASSWORD')]) {
+            checkout scm
+            ////Packing the jars
+            print "${DATA_VERSION}"
+            sh '''
+            a=${PROJECT_NAME}_${BRANCH_NAME}
+            b=$(echo -n $a | wc -c)
+            if [ $b -gt 32 ];then echo 'your project branch character combination exceeds the limit. Please keep the brnach name of hood to 24 characters' && exit 1;fi
+            '''
+            sh "mvn clean install"
+            sh "cp target/tejas-*-SNAPSHOT.jar devops/."
+
+          }
+        }
+      }
+    }
+    stage('Docker Build and Push') {
+      steps {
+        script {
+          ///building docker image
+          withCredentials([usernamePassword(credentialsId: 'hoodrepo', usernameVariable: 'HOODREPO_USERNAME', passwordVariable: 'HOODREPO_PASSWORD')]) {
+            sh '''
+            sudo docker login http://repository.nobrokerhood.com:9093 -u $HOODREPO_USERNAME -p $HOODREPO_PASSWORD
+            cd /var/jenkins_home/workspace/${PROJECT_NAME}_${BRANCH_NAME}/devops
+            sudo docker build -f Dockerfile_blackbox . -t repository.nobrokerhood.com:9093/tejas-blackbox/${BRANCH_NAME}:${BUILD_NUMBER} -t repository.nobrokerhood.com:9093/tejas-blackbox/${BRANCH_NAME}:latest
+            sudo docker push repository.nobrokerhood.com:9093/tejas-blackbox/${BRANCH_NAME}:${BUILD_NUMBER}
+            sudo docker push repository.nobrokerhood.com:9093/tejas-blackbox/${BRANCH_NAME}:latest
+            echo pushed
+              '''
+          }
+        }
+      }
+    }
+    stage('Get portainer JWT Token') {
+      when {
+        environment name:'PURPOSE', value: 'DEPLOY'
+      }
+      steps {
+        script {
+          withCredentials([usernamePassword(credentialsId: 'Portainer', usernameVariable: 'PORTAINER_USERNAME', passwordVariable: 'PORTAINER_PASSWORD')]) {
+              def json = """
+                  {"Username": "$PORTAINER_USERNAME", "Password": "$PORTAINER_PASSWORD"}
+              """
+              def jwtResponse = httpRequest acceptType: 'APPLICATION_JSON', contentType: 'APPLICATION_JSON', validResponseCodes: '200', httpMode: 'POST', ignoreSslErrors: true, consoleLogResponseBody: true, requestBody: json, url: "http://portainer:9000/api/auth"
+              def jwtObject = new groovy.json.JsonSlurper().parseText(jwtResponse.getContent())
+              env.JWTTOKEN = "Bearer ${jwtObject.jwt}"
+          }
+        }
+        echo "${env.JWTTOKEN}"
+      }
+    }
+    stage('Delete old Stack') {
+      when {
+        environment name:'PURPOSE', value: 'DEPLOY'
+      }
+      steps {
+        script {
+          // delete data-check service if present
+
+          sh "docker service rm ${BRANCH_NAME}-${PROJECT_NAME}-data-check || true"
+          
+          // Get all stacks
+          String existingStackId = ""
+          if("true") {
+            def stackResponse = httpRequest httpMode: 'GET', ignoreSslErrors: true, url: "http://portainer:9000/api/stacks", validResponseCodes: '200', consoleLogResponseBody: true, customHeaders:[[name:"Authorization", value: env.JWTTOKEN ], [name: "cache-control", value: "no-cache"]]
+            def stacks = new groovy.json.JsonSlurper().parseText(stackResponse.getContent())
+            stacks.each { stack ->
+              if(stack.Name == "${PROJECT_NAME}-${BRANCH_NAME}") {
+                existingStackId = stack.Id
+              }
+            }
+          }
+          if(existingStackId?.trim()) {
+            // Delete the stack
+            def stackURL = """
+              http://portainer:9000/api/stacks/$existingStackId
+            """
+            httpRequest acceptType: 'APPLICATION_JSON', validResponseCodes: '204', httpMode: 'DELETE', ignoreSslErrors: true, url: stackURL, customHeaders:[[name:"Authorization", value: env.JWTTOKEN ], [name: "cache-control", value: "no-cache"]]
+          }
+        }
+      }
+    }
+    stage('ENV setup') {
+      when {
+        environment name:'PURPOSE', value: 'DEPLOY'
+      }
+       steps {
+         script {
+           sh "echo data count is $DATA_COUNT"
+           print fileExists("/dev-ops/data_volumes/${STACK_NAME}")
+           if ( !(fileExists("/dev-ops/data_volumes/${STACK_NAME}")) && (params.FORCEFUL_DATA_IMPORT == false) ) {
+              DATA_COUNT = "1"
+              sh "echo data count changed to $DATA_COUNT"
+            }
+           if ( fileExists("/dev-ops/data_volumes/${STACK_NAME}") && !(fileExists("/dev-ops/data_volumes/${STACK_NAME}/complete")) ) {
+              DATA_COUNT = "1"
+              sh "echo data count changed to $DATA_COUNT"
+            }
+           sh '''#!/bin/bash
+               cd /dev-ops/logs
+               ls -ld */ | grep -o $STACK_NAME/
+               if [ $? != 1 ];then
+                 echo "Found log Folder, No need to create"
+                 sudo rm -rf /dev-ops/logs/$STACK_NAME/*
+               else
+                 echo "Did not find log Folder, created one"
+                 sudo mkdir $STACK_NAME 
+                 sudo chmod -R 777 $STACK_NAME
+               fi
+               
+               cd /dev-ops/data_volumes
+               while [ -d $STACK_NAME ] && [ $DATA_COUNT = 1 ];do
+                 echo "data folder exists, deleting folder"
+                 sudo rm -rf /dev-ops/data_volumes/$STACK_NAME
+                 echo "deleted old data set for this stack"
+               done
+               sleep 5s
+               ls -ld */ | grep -o $STACK_NAME/
+               if [ $? != 1 ];then
+                 echo "Found data Folder, No need to create"
+               else
+                 echo "Did not find data Folder, created one"
+                 sudo mkdir $STACK_NAME $STACK_NAME/elastic $STACK_NAME/mysql $STACK_NAME/mongo && sudo chmod 777 -R $STACK_NAME
+               fi
+            '''
+         }
+       }
+    }
+    stage('Deploy new stack to Portainer') {
+      when {
+        environment name:'PURPOSE', value: 'DEPLOY'
+      }
+      steps {
+        script {
+          sh "sleep 15s"
+          def createStackJson = ""
+          // Stack does not exist
+          // Generate JSON for when the stack is created
+          withCredentials([usernamePassword(credentialsId: 'Bitbucket', usernameVariable: 'BITBUCKET_USERNAME', passwordVariable: 'BITBUCKET_PASSWORD')]) {
+            def swarmResponse = httpRequest acceptType: 'APPLICATION_JSON', validResponseCodes: '200', httpMode: 'GET', ignoreSslErrors: true, consoleLogResponseBody: true, url: "http://portainer:9000/api/endpoints/1/docker/swarm", customHeaders:[[name:"Authorization", value: env.JWTTOKEN ], [name: "cache-control", value: "no-cache"]]
+            def swarmInfo = new groovy.json.JsonSlurper().parseText(swarmResponse.getContent())
+            createStackJson = """
+              {"Name": "${PROJECT_NAME}-${BRANCH_NAME}", "SwarmID": "$swarmInfo.ID", "RepositoryURL": "https://bitbucket.org/nobroker-repos/tejas/", "RepositoryReferenceName": "refs/heads/${BRANCH_NAME}", "ComposeFilePathInRepository": "devops/Docker-compose-bb.yaml", "RepositoryAuthentication": true, "RepositoryUsername": "$BITBUCKET_USERNAME", "RepositoryPassword": "$BITBUCKET_PASSWORD", "Env": [ {"name": "DOMAIN", "value": "${BRANCH_NAME}.${PROJECT_NAME}" }, {"name": "ROUTER", "value": "${BRANCH_NAME}-${PROJECT_NAME}" }, {"name": "API_BUILD", "value": "${BUILD_NUMBER}"}, {"name": "BRANCH_NAME", "value": "${BRANCH_NAME}"}, {"name": "LOG_FOLDER", "value": "${PROJECT_NAME}-${BRANCH_NAME}"}] }
+            """
+          }
+          if(createStackJson?.trim()) {
+            httpRequest acceptType: 'APPLICATION_JSON', contentType: 'APPLICATION_JSON', validResponseCodes: '200', httpMode: 'POST', ignoreSslErrors: true, consoleLogResponseBody: true, requestBody: createStackJson, url: "http://portainer:9000/api/stacks?method=repository&type=1&endpointId=1", customHeaders:[[name:"Authorization", value: env.JWTTOKEN ], [name: "cache-control", value: "no-cache"]]
+          }
+        }
+      }
+    }
+    stage('Setting stack expiration timer') {
+      when {
+         expression {
+           params.PURPOSE == 'DEPLOY' || params.PURPOSE == 'UPDATE'
+         }
+      }
+      steps {
+          wrap([$class: 'BuildUser']) {
+           sh '''
+            sed -i "/${PROJECT_NAME} ${BRANCH_NAME} /d" /var/jenkins_home/scripts/stack.txt;echo "${PROJECT_NAME} ${BRANCH_NAME} $(date +'%s') ${BUILD_USER}" >> /var/jenkins_home/scripts/stack.txt
+           '''
+          }
+      }
+    }
+    stage('Updaing your stack with new image') {
+      when {
+        environment name:'PURPOSE', value: 'UPDATE'
+      }
+      steps {
+        script {
+          sh '''
+          echo "Updating image to latest"
+          sleep 20s
+          docker service update --image=repository.nobrokerhood.com:9093/jacket-framework-blackbox/${BRANCH_NAME}:${BUILD_NUMBER} ${PROJECT_NAME}-${BRANCH_NAME}_event-insights
+          sleep 10s
+          '''
+        }
+      }
+    }
+  }
+  post {
+    success {
+      slackSend (color: '#00FF00', message: "SUCCESSFUL: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL})")
+    }
+    failure {
+     slackSend (color: '#FF0000', message: "FAILED: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL})")
+    }
+  }
+}
+
