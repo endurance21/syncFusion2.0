@@ -1,0 +1,63 @@
+version: '3.7'
+
+configs:
+ blackbox-nginx:
+    file: ./blackbox-nginx.conf
+
+services:
+  Tejas:
+    image: repository.syncfusion.com:9093/tejas-blackbox/${BRANCH_NAME}:${API_BUILD}
+    environment:
+      ENVIRONMENT: stage
+    tty: true
+    stdin_open: true
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: '0.7'
+          memory: 2G
+        reservations:
+          cpus: '0.1'
+          memory: 500M
+      placement:
+         constraints:
+          - node.role == worker
+
+  nginx:
+    image: repository.syncfusion.com:9093/nginx:1
+    configs:
+      - source: blackbox-nginx
+        target: /etc/nginx/conf.d/default.conf
+    depends_on:
+      - hood
+    networks:
+        - traefik-public
+        - backend
+    deploy:
+      resources:
+        limits:
+          cpus: '0.6'
+          memory: 250M
+        reservations:
+          cpus: '0.1'
+          memory: 50M
+      placement:
+        constraints:
+          - node.role == worker
+      labels:
+          - "traefik.enable=true"
+          - "traefik.http.routers.nginx-${ROUTER}.rule=Host(`main-tejas.syncfusion.com`)"
+          - "traefik.http.routers.nginx-${ROUTER}.entrypoints=https"
+          - "traefik.http.routers.nginx-${ROUTER}.tls=true"
+          - "traefik.http.routers.nginx-${ROUTER}.service=nginx-${ROUTER}"
+          - "traefik.http.routers.nginx-${ROUTER}.tls.certresolver=myresolver"
+          - "traefik.http.services.nginx-${ROUTER}.loadbalancer.server.port=80"
+
+
+networks:
+  backend:
+  traefik-public:
+    external: true
+

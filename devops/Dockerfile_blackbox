@@ -1,0 +1,13 @@
+FROM openjdk:17-ea-slim
+ENV TZ=Asia/Kolkata
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+RUN mkdir -p /tmp/hood && mkdir -p /var/log/hood
+RUN mkdir -p /tmp/config
+ENV PROFILE prod
+ENV HOSTNAME tejas
+ENV JAVA_OPTS ""
+
+WORKDIR /tmp/hood
+
+ADD tejas-*-SNAPSHOT.jar /tmp/hood/
+ENTRYPOINT exec java -Dspring.profiles.active=blackbox -DNB_LOG_FILE=/var/log/hood/${HOSTNAME}-app.log -DNB_ACCESS_LOG_FILE=/var/log/hood/${HOSTNAME}-access.log -jar tejas-*-SNAPSHOT.jar

@@ -1,0 +1,18 @@
+FROM openjdk:17-ea-slim
+ENV TZ=Asia/Kolkata
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+RUN mkdir -p /tmp/hood && mkdir -p /var/log/hood
+RUN mkdir -p /tmp/config
+ENV PROFILE prod
+ENV HOSTNAME tejas
+ENV JAVA_OPTS ""
+ENV APM_URL http://10.160.4.202:39200
+ENV APM_SERVICE_NAME Tejas
+ENV APM_SCAN_PACKAGES com.syncfusion
+
+COPY elastic-apm-agent-1.35.0.jar /tmp/hood/elastic-apm-agent.jar
+
+WORKDIR /tmp/hood
+
+ADD tejas-*.jar /tmp/hood/
+ENTRYPOINT exec java  -javaagent:/tmp/hood/elastic-apm-agent.jar -Delastic.apm.service_name=${APM_SERVICE_NAME} -Delastic.apm.disable_instrumentations=dispatcher-servlet -Delastic.apm.server_urls=${APM_URL}  -Delastic.apm.application_packages=${APM_SCAN_PACKAGES} -Delastic.apm.environment=${PROFILE} -Dspring.profiles.active=prod -DNB_LOG_FILE=/var/log/hood/${HOSTNAME}-app.log -DNB_ACCESS_LOG_FILE=/var/log/hood/${HOSTNAME}-access.log -jar /tmp/hood/tejas-*.jar
